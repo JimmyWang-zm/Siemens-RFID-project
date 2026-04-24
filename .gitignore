@@ -1,0 +1,19 @@
+# 日志数据文件（不上传实际记录数据）
+records/logs/
+logs/
+*.jsonl
+*.csv
+last_payload.html
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.suo
