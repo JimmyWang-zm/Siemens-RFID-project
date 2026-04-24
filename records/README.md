@@ -1,142 +1,109 @@
-# Siemens RFID 读取日志脚本
+# Siemens RF695R RFID Logger
 
-## 推荐：OPC UA 自动过站记录（功能 1 + 2）
+Scripts for logging RFID reads from a Siemens SIMATIC RF695R reader (with RF662A antenna) to local files.
 
-`rfid_opcua_logger.py` 通过 OPC UA 协议同时实现两个核心功能：
-
-**功能 1 — 自动开始/停止扫描**
-- 实时轮询 `Diagnostics > Presence` 变量（手册 Section 3.3.3）
-- 小车到来（Presence: 0 → >0）→ 自动调用 `ScanStart`（手册 3.1.2）
-- 小车离开（Presence: >0 → 0）→ 自动调用 `ScanStop`
-
-**功能 2 — 标签自动写入 CSV**
-- 订阅 `RfidScanEventType` 事件，实时接收标签数据
-- 每次过站结束后将本次所有标签写入每日 CSV
-
-### WBM 前置配置（Settings > Communication > OPC UA）
-
-| 选项 | 要求 |
-|------|------|
-| OPC UA 模式 | Main application |
-| Presence events | **必须启用** |
-| Last access events | 建议启用 |
-| OPC UA 端口 | 默认 4840 |
-
-### 快速启动
-
-1. 首次安装依赖（只需一次）：
-   ```powershell
-   pip install asyncua
-   ```
-2. 双击 `run_opcua_logger.bat`（或手动运行 `python rfid_opcua_logger.py`）
-
-### 关键配置项（`rfid_opcua_logger.py` 顶部）
-
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `OPCUA_URL` | `opc.tcp://192.168.0.254:4840` | OPC UA 服务器地址 |
-| `OPCUA_USER` / `OPCUA_PASS` | 空 | WBM 认证用户名/密码 |
-| `OUTPUT_DIR` | `C:\rfid_logger\records` | CSV 输出目录 |
-| `READ_POINT` | `1` | 读点编号（RF695R 最多 4 个） |
-| `POLL_INTERVAL` | `0.5` | Presence 轮询间隔（秒） |
+Default reader address: `https://192.168.0.254/`
 
 ---
 
-这个脚本用于把 RF695R 读写器（配 RF662A 天线）每次读取到的数据自动记录到本地文件，方便工人查看历史记录。
+## OPC UA Logger — Recommended (`rfid_opcua_logger.py`)
 
-默认读取地址是：`https://192.168.0.254/`
+Connects via OPC UA and implements two core features:
 
-## 生成的日志文件
+**Feature 1 — Auto start/stop scanning**
+Polls `Diagnostics > Presence` every 500 ms. Calls `ScanStart` when a cart arrives and `ScanStop` when it leaves.
 
-脚本运行后会在 `logs/` 目录下生成：
+**Feature 2 — Tag data saved to CSV**
+Subscribes to `RfidScanEventType` events. Writes all tags from each cart pass to a daily CSV file.
 
-- `rfid_reads.csv`：适合 Excel 打开查看
-- `rfid_reads.jsonl`：完整原始数据（便于后续分析）
+### WBM setup (Settings > Communication > OPC UA)
 
-## 使用方法（推荐）
+| Setting | Required value |
+|---------|----------------|
+| Mode | Main application (uncheck Parallel) |
+| Presence events | Enabled |
+| Security | Allow anonymous access |
+| Port | 4840 (default) |
 
-1. 安装 Python 3（Windows 安装时勾选 Add Python to PATH）
-2. 双击运行 `run_logger.bat`
-3. 读写器有新数据时，会自动追加到日志文件
-
-如果你是在 PowerShell 手动运行，请使用：
-
-```powershell
-.\run_logger.bat
-```
-
-不要直接输入 `run_logger.bat`，否则不会执行当前目录脚本。
-
-建议先做一次连通性测试（会在控制台打印成功或超时信息）：
+### Quick start
 
 ```powershell
-python -u .\rfid_logger.py --url "https://192.168.0.254/" --interval 1 --timeout 8 --insecure
+pip install asyncua
+python rfid_opcua_logger.py
 ```
 
-## 命令行运行（可选）
+Or double-click `run_opcua_logger.bat` — it installs the dependency automatically on first run.
 
-```bash
+### Configuration (`rfid_opcua_logger.py` header)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OPCUA_URL` | `opc.tcp://192.168.0.254:4840` | OPC UA server endpoint |
+| `OPCUA_USER` / `OPCUA_PASS` | empty | WBM credentials (leave empty for anonymous) |
+| `OUTPUT_DIR` | `C:\rfid_logger\records` | CSV output directory |
+| `READ_POINT` | `1` | Read point index (RF695R supports up to 4) |
+| `POLL_INTERVAL` | `0.5` | Presence poll interval in seconds |
+
+---
+
+## TCP XML Logger (`rfid_auto_save.py`)
+
+Connects to the reader's TCP XML channel. Detects cart arrival by the first tag seen and cart departure by an idle timeout (no tags for `IDLE_TIMEOUT` seconds).
+
+```powershell
+python rfid_auto_save.py
+```
+
+---
+
+## HTTP Polling Logger (`rfid_logger.py`)
+
+Polls the reader's web interface or API endpoint and logs every change.
+
+```powershell
 python rfid_logger.py --url "https://192.168.0.254/" --interval 1 --insecure
 ```
 
-常用参数：
+Common options:
 
-- `--url`：读写器页面/API地址（默认 `https://192.168.0.254/`）
-- `--interval`：轮询间隔秒数（默认 `1`）
-- `--timeout`：请求超时秒数（默认 `3`）
-- `--log-all`：每次轮询都记录；默认只在数据变化时记录
-- `--insecure`：跳过 HTTPS 证书校验（设备自签名证书常用）
-- `--cookie`：附带浏览器登录态 Cookie（页面需要登录时）
-- `--header`：自定义请求头（可重复添加）
-- `--debug-payload`：把每次响应原文写入指定文件，便于排查 `tags=0`
-- `--basic-auth`：使用 HTTP Basic 认证（格式 `用户:密码`）
-- `--discover-endpoints`：自动扫描并测试可能的数据接口 URL（推荐在 `tags=0` 时使用）
-- `--mode xml`：使用 RF69xR 官方 XML 通道（推荐）
-- `--xml-port`：XML 通道端口（在 WBM 的 `Settings > Communication > XML` 中配置）
+| Flag | Description |
+|------|-------------|
+| `--url` | Reader URL (default `https://192.168.0.254/`) |
+| `--interval` | Poll interval in seconds |
+| `--timeout` | Request timeout in seconds |
+| `--log-all` | Log every poll, not just on change |
+| `--insecure` | Skip HTTPS certificate check |
+| `--cookie` | Browser cookie for authenticated endpoints |
+| `--basic-auth` | HTTP Basic auth (`user:pass`) |
+| `--mode xml` | Use RF69xR XML channel (recommended) |
+| `--xml-port` | XML channel TCP port (set in WBM) |
+| `--discover-endpoints` | Auto-scan for data endpoints |
+| `--debug-payload` | Dump raw response to file for debugging |
 
-## CSV 字段说明
+---
 
-- `timestamp`：记录时间（本地时区）
-- `source_url`：读取地址
-- `host_name`：运行脚本的电脑名
-- `tag_count`：识别出的标签数量
-- `tags`：识别出的标签值（用 `|` 分隔）
-- `payload_hash`：原始数据哈希（用于判断变化）
-- `raw_preview`：原始数据简要预览
+## Output files
 
-## 注意事项
+| File | Description |
+|------|-------------|
+| `RFID_YYYY-MM-DD.csv` | Daily tag log (OPC UA / XML session loggers) |
+| `logs/rfid_reads.csv` | Continuous log (HTTP polling logger) |
+| `logs/rfid_reads.jsonl` | Full raw records in JSON Lines format |
 
-- 如果你实际读取接口不是根路径 `/`，请把 `--url` 改成真实接口，比如：
-  - `http://192.168.0.254/api/read`
-  - `http://192.168.0.254/rfid`
-- `https://192.168.0.254/#page=9` 里的 `#page=9` 只是浏览器前端路由，脚本里不要带 `#...`，直接用 `https://192.168.0.254/` 即可。
-- 若终端是 `saved | tags=0`，常见原因是接口需要登录态。可在浏览器开发者工具里复制请求头里的 `Cookie`，再这样运行：
-  - `python -u .\rfid_logger.py --url "https://192.168.0.254/实际数据接口" --insecure --cookie "你的Cookie" --debug-payload ".\logs\last_payload.html" --log-all`
-- 如果无法使用 F12，可先测试设备是否支持 Basic 认证：
-  - `python -u .\rfid_logger.py --url "https://192.168.0.254/" --insecure --basic-auth "admin:你的密码" --log-all --debug-payload ".\logs\last_payload.html"`
-- 如果一直 `tags=0`，可自动探测候选接口：
-  - `python -u .\rfid_logger.py --url "https://192.168.0.254/" --insecure --discover-endpoints`
-  - 若需要带登录态：`python -u .\rfid_logger.py --url "https://192.168.0.254/" --insecure --cookie "你的Cookie" --discover-endpoints`
+### CSV columns (OPC UA / XML loggers)
 
-## 推荐：XML 官方接口采集（不用抓网页）
+| Column | Description |
+|--------|-------------|
+| `Timestamp` | Local time of the read |
+| `EPC/Tag ID` | Tag identifier |
+| `Antenna` | Antenna that detected the tag |
+| `RSSI (dBm)` | Signal strength |
+| `Session ID` | Unique ID per cart pass |
 
-在设备 WBM 中先配置：
+---
 
-1. `Settings > Communication > XML`：启用 XML
-2. 启用至少一种事件（建议先开 `Observed events`）
-3. 选择 `Transmitting read point`（至少一个读点）
-4. 设置 `XML channel (1-4)` 的端口号（记下这个端口）
+## Notes
 
-然后运行：
-
-```powershell
-python -u .\rfid_logger.py --mode xml --url "https://192.168.0.254/" --xml-port 这里填XML端口 --timeout 8 --log-all
-```
-
-可选调试：
-
-```powershell
-python -u .\rfid_logger.py --mode xml --url "https://192.168.0.254/" --xml-port 这里填XML端口 --timeout 8 --log-all --debug-payload ".\logs\last_xml_payload.xml"
-```
-- 电脑与读写器要在同一网段，能互相访问。
-- 如需 24 小时运行，建议放到一台固定工位机并设置开机自启动。
+- Make sure the PC and reader are on the same subnet and can reach each other.
+- For 24/7 operation, consider setting the script to run on Windows startup.
+- If `tags=0` with the HTTP logger, the endpoint likely requires authentication — use `--cookie` or `--basic-auth`.

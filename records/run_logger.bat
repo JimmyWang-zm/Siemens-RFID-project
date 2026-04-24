@@ -1,8 +1,7 @@
-
 @echo off
 setlocal
 
-REM One-click launcher for workers
+REM One-click launcher for rfid_logger.py (HTTP/XML polling mode)
 cd /d "%~dp0"
 
 if not exist logs mkdir logs
