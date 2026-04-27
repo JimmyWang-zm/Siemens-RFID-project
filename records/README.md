@@ -10,20 +10,59 @@ Default reader address: `https://192.168.0.254/`
 
 Connects via OPC UA and implements two core features:
 
-**Feature 1 — Auto start/stop scanning**
-Polls `Diagnostics > Presence` every 500 ms. Calls `ScanStart` when a cart arrives and `ScanStop` when it leaves.
+**Feature 1 — Auto start/stop scanning (DI sensor trigger)**
+Polls Digital Input 0 (IO-Link photoelectric sensor) every 200 ms.
+- Sensor sees reflector → DI HIGH (yellow LED on) → `ScanStart`
+- Beam blocked by object → DI LOW (yellow LED off) → `ScanStop`
+
+A legacy `"Presence"` mode (OPC UA built-in field detection) is also supported via `TRIGGER_SOURCE`.
 
 **Feature 2 — Tag data saved to CSV**
-Subscribes to `RfidScanEventType` events. Writes all tags from each cart pass to a daily CSV file.
+Subscribes to `RfidScanEventType` events. Writes all tags from each scan session to a daily CSV file.
 
-### WBM setup (Settings > Communication > OPC UA)
+---
+
+### WBM setup — OPC UA (Settings › Communication › OPC UA)
 
 | Setting | Required value |
 |---------|----------------|
 | Mode | Main application (uncheck Parallel) |
-| Presence events | Enabled |
 | Security | Allow anonymous access |
 | Port | 4840 (default) |
+
+---
+
+### WBM setup — DI/DO (Settings › DIDO) for Feature 1
+
+These steps configure the RF695R's IO-Link / digital input to drive the yellow indicator and let the software detect sensor state via OPC UA.
+
+**1. Select IO-Link mode**
+
+At the top of the DIDO page, select **IO-Link** from the mode dropdown.
+
+**2. Wire the sensor**
+
+Connect the photoelectric sensor signal wire (NPN/PNP output) to the reader's **Input 0** terminal (DI0).
+
+**3. Add Output 0 events (yellow indicator)**
+
+On the **Output 0** tab, click **+** twice and add these two event rules:
+
+| # | On | Input | Edge | Then | Output | Action |
+|---|----|-------|------|------|--------|--------|
+| 1 | Input change | Input 0 | Rising | → | Output 0 | On |
+| 2 | Input change | Input 0 | Falling | → | Output 0 | Off |
+
+- **Rising / On**: sensor detects reflector → yellow LED turns on → software issues `ScanStart`
+- **Falling / Off**: beam blocked by object → yellow LED turns off → software issues `ScanStop`
+
+Click **Save** and apply the configuration.
+
+> **Note:** The DO event rules control the physical indicator output.
+> The actual `ScanStart` / `ScanStop` commands are issued by `rfid_opcua_logger.py`
+> based on polling the same DI0 state via OPC UA.
+
+---
 
 ### Quick start
 
@@ -34,6 +73,8 @@ python rfid_opcua_logger.py
 
 Or double-click `run_opcua_logger.bat` — it installs the dependency automatically on first run.
 
+---
+
 ### Configuration (`rfid_opcua_logger.py` header)
 
 | Variable | Default | Description |
@@ -42,7 +83,14 @@ Or double-click `run_opcua_logger.bat` — it installs the dependency automatica
 | `OPCUA_USER` / `OPCUA_PASS` | empty | WBM credentials (leave empty for anonymous) |
 | `OUTPUT_DIR` | `C:\rfid_logger\records` | CSV output directory |
 | `READ_POINT` | `1` | Read point index (RF695R supports up to 4) |
-| `POLL_INTERVAL` | `0.5` | Presence poll interval in seconds |
+| `POLL_INTERVAL` | `0.2` | Trigger poll interval in seconds |
+| `TRIGGER_SOURCE` | `"DI"` | `"DI"` = IO-Link sensor; `"Presence"` = OPC UA built-in |
+| `DI_CHANNEL` | `0` | IO-Link / digital input channel index (0-based) |
+| `DEBUG_BROWSE` | `False` | Set `True` once to print the OPC UA tree and locate the DI node |
+
+#### First-run node discovery
+
+If the logger prints `DI0 node not found`, the OPC UA path to the digital input differs on your firmware version. Set `DEBUG_BROWSE = True`, run the script once, and search the printed tree for nodes named `Input`, `DI`, `IOLink`, or `ProcessData`. Then set `DEBUG_BROWSE = False` for normal operation.
 
 ---
 
