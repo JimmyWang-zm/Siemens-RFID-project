@@ -1,7 +1,7 @@
 @echo off
 setlocal
 
-REM One-click launcher for rfid_opcua_logger.py
+REM One-click launcher for rfid_opcua RFID logger
 REM Installs asyncua automatically on first run.
 
 cd /d "%~dp0"

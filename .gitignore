@@ -9,6 +9,7 @@ last_payload.html
 __pycache__/
 *.py[cod]
 *.pyo
+*.bak
 .env
 venv/
 .venv/
