@@ -2,19 +2,20 @@
 rfid_opcua.opcua_helpers
 ────────────────────────
 OPC UA node discovery, event subscription setup, scan start/stop,
-tree browsing, and LastScan* polling.
+and tree browsing.
 """
 
 from __future__ import annotations
 
+import logging
+
 from asyncua import Client, ua
 
-from .config import (
-    DI_CHANNEL,
-    EVENT_PUBLISH_INTERVAL,
-)
-from .handlers import ScanEventHandler, epc_to_hex
+from .config import DI_CHANNEL
+from .handlers import ScanEventHandler
 from .session import Session
+
+log = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -53,9 +54,8 @@ async def find_nodes(client: Client, rp_index: int):
         raise RuntimeError(f"Read point {rp_index} not found (only {len(readpoints)} available)")
 
     rp = readpoints[rp_index - 1]
-    print(f"[INFO] Read point : {(await rp.read_browse_name()).Name}")
+    log.debug("Read point : %s", (await rp.read_browse_name()).Name)
 
-    presence_node    = None
     scan_active_node = None
     scan_start_node  = None
     scan_stop_node   = None
@@ -65,13 +65,13 @@ async def find_nodes(client: Client, rp_index: int):
         bn = (await c.read_browse_name()).Name
         if bn == "ScanActive":
             scan_active_node = c
-            print("       ScanActive ✓")
+            log.debug("  ScanActive \u2713")
         elif bn == "ScanStart":
             scan_start_node = c
-            print("       ScanStart  ✓")
+            log.debug("  ScanStart  \u2713")
         elif bn == "ScanStop":
             scan_stop_node = c
-            print("       ScanStop   ✓")
+            log.debug("  ScanStop   \u2713")
         elif bn == "LastScanData":
             scan_nodes["data"] = c
         elif bn == "LastScanAntenna":
@@ -82,9 +82,9 @@ async def find_nodes(client: Client, rp_index: int):
             scan_nodes["timestamp"] = c
 
     if all(scan_nodes[k] is not None for k in ("data", "antenna", "rssi", "timestamp")):
-        print("       LastScan*  ✓  (Data / Antenna / RSSI / Timestamp)")
+        log.debug("  LastScan*  \u2713  (Data / Antenna / RSSI / Timestamp)")
     else:
-        print(f"[WARN] LastScan* nodes incomplete: {[k for k,v in scan_nodes.items() if v is None]}")
+        log.warning("LastScan* nodes incomplete: %s", [k for k,v in scan_nodes.items() if v is None])
 
     di_node = await _find_di_node(client, rp, DI_CHANNEL)
 
@@ -105,10 +105,10 @@ async def _find_di_node(client: Client, rp, di_channel: int):
                     if (await c2.read_browse_name()).Name == "DigitalIOPorts":
                         for c3 in await c2.get_children():
                             if (await c3.read_browse_name()).Name == "DigitalInputs":
-                                print(f"       DI inputs  ✓  [IOData > DigitalIOPorts > DigitalInputs  (bit {di_channel})]")
+                                log.debug("  DI inputs  \u2713  [IOData > DigitalIOPorts > DigitalInputs  (bit %d)]", di_channel)
                                 return c3
     except Exception as e:
-        print(f"[WARN] Direct IOData path failed: {e}")
+        log.warning("Direct IOData path failed: %s", e)
 
     # DFS fallback
     root    = client.get_root_node()
@@ -163,10 +163,10 @@ async def _find_di_node(client: Client, rp, di_channel: int):
     found = await dfs(search_root, in_group=False, depth=0)
     if found:
         name = (await found.read_browse_name()).Name
-        print(f"       DI{di_channel} node  ✓  [{name}]  (DFS fallback)")
+        log.debug("  DI%d node  \u2713  [%s]  (DFS fallback)", di_channel, name)
     else:
-        print(f"[WARN] DI{di_channel} node not found.")
-        print("       Set DEBUG_BROWSE=True and restart to inspect the OPC UA tree.")
+        log.warning("DI%d node not found.", di_channel)
+        log.warning("       Set DEBUG_BROWSE=True and restart to inspect the OPC UA tree.")
     return found
 
 
@@ -207,7 +207,7 @@ async def find_event_type(client: Client, *type_names: str):
     try:
         await _dfs(base)
     except Exception as e:
-        print(f"[WARN] Event type discovery failed: {e}")
+        log.warning("Event type discovery failed: %s", e)
 
     for name in type_names:
         if name in candidates:
@@ -216,76 +216,45 @@ async def find_event_type(client: Client, *type_names: str):
 
 
 async def setup_scan_event_subscription(
-    client: Client, rp, session: Session, publish_interval: int = 100
+    client: Client, rp, session: Session, publish_interval: int = 100,
+    scan_nodes: dict | None = None,
 ):
     """
     Create an OPC UA event subscription for RfidScanEventType on the read point.
-    Returns (subscription, handler) on success, (None, None) on failure.
+    Returns (subscription, handler).  Raises RuntimeError on failure.
     """
     evt_type = await find_event_type(client, "RfidScanEventType", "AutoIdScanEventType")
     if evt_type is None:
-        print("[WARN] RfidScanEventType not found in server type hierarchy")
-        print("       → Falling back to LastScan* variable polling (single-tag mode)")
-        return None, None
+        raise RuntimeError(
+            "RfidScanEventType not found in server type hierarchy — "
+            "ensure the reader firmware supports OPC UA events"
+        )
 
     type_name = (await evt_type.read_browse_name()).Name
-    print(f"[INFO] Event type   : {type_name}  ({evt_type.nodeid})")
+    log.debug("Event type: %s  (%s)", type_name, evt_type.nodeid)
 
-    handler = ScanEventHandler(session)
+    handler = ScanEventHandler(session, scan_nodes=scan_nodes)
     sub = None
     try:
         sub = await client.create_subscription(publish_interval, handler)
         await sub.subscribe_events(rp, evt_type)
-        print(f"[SUB]  Subscribed to {type_name} events  (publish: {publish_interval} ms)")
+        log.debug("Subscribed to %s events  (publish: %d ms)", type_name, publish_interval)
         return sub, handler
     except Exception as e:
-        print(f"[WARN] Event subscription failed: {e}")
-        print("       → Falling back to LastScan* variable polling (single-tag mode)")
         if sub is not None:
             try:
                 await sub.delete()
             except Exception:
                 pass
-        return None, None
+        raise RuntimeError(f"Event subscription failed: {e}") from e
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Scan start / stop
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def start_scanning(rp, scan_start_node, scan_active_node, use_events: bool = False):
-    """Start continuous scanning on the read point."""
-    if use_events and scan_start_node is not None:
-        try:
-            scan_settings_cls = getattr(ua, "ScanSettings", None)
-            if scan_settings_cls is not None:
-                ss = scan_settings_cls()
-                ss.Cycles        = 0
-                ss.DataAvailable = False
-                ss.Duration      = 0
-                await rp.call_method(scan_start_node, ss)
-            else:
-                await rp.call_method(
-                    scan_start_node,
-                    ua.Variant(0,     ua.VariantType.UInt32),
-                    ua.Variant(False, ua.VariantType.Boolean),
-                    ua.Variant(0,     ua.VariantType.UInt32),
-                )
-            print("[CMD] ScanStart (event mode — continuous)")
-            return
-        except Exception as e:
-            print(f"[WARN] ScanStart method failed: {e} — trying ScanActive")
-
-    if scan_active_node is not None:
-        try:
-            await scan_active_node.write_value(
-                ua.DataValue(ua.Variant(True, ua.VariantType.Boolean))
-            )
-            print("[CMD] ScanActive = True")
-            return
-        except Exception as e:
-            print(f"[WARN] ScanActive write failed: {e} — trying ScanStart")
-
+async def start_scanning(rp, scan_start_node, scan_active_node):
+    """Start continuous scanning on the read point (ScanStart preferred)."""
     if scan_start_node is not None:
         try:
             scan_settings_cls = getattr(ua, "ScanSettings", None)
@@ -302,83 +271,41 @@ async def start_scanning(rp, scan_start_node, scan_active_node, use_events: bool
                     ua.Variant(False, ua.VariantType.Boolean),
                     ua.Variant(0,     ua.VariantType.UInt32),
                 )
-            print("[CMD] ScanStart")
-        except Exception as e:
-            print(f"[ERR] ScanStart failed: {e}")
-
-
-async def stop_scanning(rp, scan_stop_node, scan_active_node, use_events: bool = False):
-    """Stop scanning."""
-    if use_events and scan_stop_node is not None:
-        try:
-            await rp.call_method(scan_stop_node)
-            print("[CMD] ScanStop (event mode)")
+            log.debug("ScanStart (continuous)")
             return
         except Exception as e:
-            print(f"[WARN] ScanStop method failed: {e} — trying ScanActive")
+            log.warning("ScanStart method failed: %s \u2014 trying ScanActive", e)
+
+    if scan_active_node is not None:
+        try:
+            await scan_active_node.write_value(
+                ua.DataValue(ua.Variant(True, ua.VariantType.Boolean))
+            )
+            log.debug("ScanActive = True")
+            return
+        except Exception as e:
+            log.error("ScanActive write also failed: %s", e)
+
+
+async def stop_scanning(rp, scan_stop_node, scan_active_node):
+    """Stop scanning on the read point (ScanStop preferred)."""
+    if scan_stop_node is not None:
+        try:
+            await rp.call_method(scan_stop_node)
+            log.debug("ScanStop")
+            return
+        except Exception as e:
+            log.warning("ScanStop method failed: %s \u2014 trying ScanActive", e)
 
     if scan_active_node is not None:
         try:
             await scan_active_node.write_value(
                 ua.DataValue(ua.Variant(False, ua.VariantType.Boolean))
             )
-            print("[CMD] ScanActive = False")
+            log.debug("ScanActive = False")
             return
         except Exception as e:
-            print(f"[WARN] ScanActive write failed: {e} — trying ScanStop")
-
-    if scan_stop_node is not None:
-        try:
-            await rp.call_method(scan_stop_node)
-            print("[CMD] ScanStop")
-        except Exception as e:
-            print(f"[ERR] ScanStop failed: {e}")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  LastScan* polling (fallback)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-async def poll_last_scan(session: Session, scan_nodes: dict, prev_ts):
-    """
-    Poll LastScan* variables for new tag reads.
-    Only suitable for single-tag mode (manual §3.1.3).
-    Returns updated timestamp.
-    """
-    ts_node = scan_nodes.get("timestamp")
-    if ts_node is None:
-        return prev_ts
-    try:
-        ts = await ts_node.read_value()
-    except Exception:
-        return prev_ts
-
-    if ts is None or ts == prev_ts:
-        return prev_ts
-
-    epc_raw, ant, rssi_raw = None, "?", None
-    try:
-        if scan_nodes.get("data"):
-            epc_raw = await scan_nodes["data"].read_value()
-        if scan_nodes.get("antenna"):
-            ant = await scan_nodes["antenna"].read_value()
-        if scan_nodes.get("rssi"):
-            rssi_raw = await scan_nodes["rssi"].read_value()
-    except Exception as e:
-        print(f"[WARN] LastScan read error: {e}")
-        return ts
-
-    rssi = "?"
-    if rssi_raw is not None:
-        try:
-            rssi = f"{int(rssi_raw) / 100:.1f}"
-        except Exception:
-            rssi = str(rssi_raw)
-
-    epc = epc_to_hex(epc_raw)
-    if epc:
-        session.add_tag(epc, str(ant), rssi)
-    return ts
+            log.error("ScanActive write also failed: %s", e)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -401,14 +328,15 @@ async def browse_tree(client: Client, max_depth: int = 5):
             try:
                 bn  = await child.read_browse_name()
                 nid = child.nodeid
-                print("  " * depth + f"[{bn.NamespaceIndex}:{bn.Name}]  {nid}")
+                log.info("%s[%d:%s]  %s", "  " * depth, bn.NamespaceIndex, bn.Name, nid)
                 await _print(child, depth + 1)
             except Exception:
                 continue
 
-    print("\n" + "=" * 60)
-    print("  OPC UA node tree  (DEBUG_BROWSE = True)")
-    print("  Search for 'Input', 'DI', 'IOLink', 'ProcessData' nodes")
-    print("=" * 60)
+    log.info("")
+    log.info("=" * 60)
+    log.info("  OPC UA node tree  (DEBUG_BROWSE = True)")
+    log.info("  Search for 'Input', 'DI', 'IOLink', 'ProcessData' nodes")
+    log.info("=" * 60)
     await _print(objects, 0)
-    print("=" * 60 + "\n")
+    log.info("=" * 60)

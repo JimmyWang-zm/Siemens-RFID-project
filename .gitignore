@@ -1,8 +1,9 @@
-# 日志数据文件（不上传实际记录数据）
-records/logs/
+# Data / log files (not tracked)
+records/
 logs/
 *.jsonl
 *.csv
+*.csv.tmp
 last_payload.html
 
 # Python

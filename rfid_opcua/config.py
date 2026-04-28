@@ -14,23 +14,37 @@ OPCUA_PASS     = ""
 READ_POINT     = 1           # read-point index (1-based; RF695R supports up to 4)
 
 # ── Output ────────────────────────────────────────────────────────────────────
-OUTPUT_DIR     = r"C:\rfid_logger\records"
+import pathlib as _pathlib
+_PROJECT_DIR   = _pathlib.Path(__file__).resolve().parent.parent
+OUTPUT_DIR     = str(_PROJECT_DIR / "records")
+CSV_FILENAME   = "RFID_log.csv"             # single file — appended to forever
 
 # ── Trigger (photoelectric sensor via IO-Link / digital input) ─────────────────
 DI_CHANNEL     = 0           # IO-Link / DI channel index (0-based)
+DI_DEBOUNCE_S  = 0.3         # seconds — ignore re-triggers within this window
+DI_STOP_DELAY_S = 0.15       # seconds — wait before ending session on falling edge
+                              #   (absorbs brief sensor flicker / beam interruptions)
 
-# ── Timing / polling ─────────────────────────────────────────────────────────
-POLL_INTERVAL  = 0.2         # seconds — fallback DI trigger poll
+# ── Timing ────────────────────────────────────────────────────────────────────
 RETRY_DELAY    = 5           # seconds before reconnect attempt
 DI_SAMPLE_MS   = 100         # ms — OPC UA sampling interval for DI subscription
 
 # ── Event-based tag reading ───────────────────────────────────────────────────
-# True = use RfidScanEventType subscription (recommended by Siemens manual §2.3.2).
-# Automatically falls back to LastScan* polling if the server doesn't support events.
-PREFER_EVENTS          = True
+# RfidScanEventType subscription (Siemens manual §2.3.2).
 EVENT_PUBLISH_INTERVAL = 100   # ms — OPC UA subscription publish interval for events
+
+# ── Watchdog ──────────────────────────────────────────────────────────────────
+# If no scan event arrives for this many seconds during an active scan session,
+# the watchdog treats the subscription as dead and forces a reconnect.
+# Set to 0 to disable.
+WATCHDOG_TIMEOUT       = 30    # seconds — max silence before reconnect
 
 # ── Debug ─────────────────────────────────────────────────────────────────────
 # Set True once to print the full OPC UA node tree and locate the DI node path.
 # Set back to False for normal operation after the node path is confirmed.
 DEBUG_BROWSE   = False
+# ── Logging ───────────────────────────────────────────────────────────────
+LOG_DIR        = str(_PROJECT_DIR / "logs")    # directory for rotating log files
+LOG_LEVEL      = "INFO"                   # DEBUG, INFO, WARNING, ERROR
+LOG_MAX_BYTES  = 5 * 1024 * 1024          # 5 MB per log file
+LOG_BACKUP_COUNT = 5                      # keep 5 rotated files
