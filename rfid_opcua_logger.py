@@ -24,10 +24,10 @@ Tag detection
 
 Output
 ------
-    A daily CSV is written to OUTPUT_DIR with one row per unique EPC per
-    session. Within a single run, an EPC that has already been saved in any
-    previous session is skipped, so each row in the CSV represents a tag
-    that was newly identified during the run.
+    A daily CSV is written to OUTPUT_DIR with at most one row per EPC for that
+    calendar day. When the same tag is seen again (another session or after a
+    restart), the existing row is replaced with the latest timestamp, antenna,
+    RSSI, and session id.
 
 References
 ----------
@@ -60,6 +60,7 @@ import csv
 import os
 import time
 from datetime import datetime
+from typing import Optional
 
 try:
     from asyncua import Client, ua
@@ -70,33 +71,47 @@ except ImportError:
 # =============================================================================
 # Configuration
 # =============================================================================
-OPCUA_URL      = "opc.tcp://192.168.0.254:4840"
-OPCUA_USER     = ""                              # Empty for anonymous access
-OPCUA_PASS     = ""
-OUTPUT_DIR     = r"C:\rfid_logger\records"       # CSV output directory
-READ_POINT     = 1                               # 1-based read-point index (RF695R supports up to 4)
-POLL_INTERVAL  = 0.2                             # Seconds between trigger polls
-RETRY_DELAY    = 5                               # Seconds before reconnect attempt
+OPCUA_URL = "opc.tcp://192.168.0.254:4840"
+OPCUA_USER = ""  # Empty for anonymous access
+OPCUA_PASS = ""
+OUTPUT_DIR = r"C:\rfid_logger\records"  # CSV output directory
+READ_POINT = 1  # 1-based read-point index (RF695R supports up to 4)
+POLL_INTERVAL = 0.2  # Seconds between trigger polls
+RETRY_DELAY = 5  # Seconds before reconnect attempt
+
+# DI trigger: when the beam breaks, scanning pauses. If the beam clears within
+# this many seconds, the same session continues (one CSV write when the run
+# truly ends). If the beam stays broken longer, the session is finalized and
+# the process exits so data is not split across many short sessions/files.
+BLOCK_GRACE_SEC = 10.0
+
+# Retries when the daily CSV is locked (e.g. open in Excel) before using a
+# per-session backup file.
+CSV_WRITE_RETRIES = 12
+CSV_RETRY_DELAY_SEC = 0.25
 
 # Trigger source: "DI" uses an external IO-Link sensor; "Presence" uses the
 # reader's built-in Diagnostics/Presence variable.
 TRIGGER_SOURCE = "DI"
-DI_CHANNEL     = 0                               # 0-based digital input channel index
+DI_CHANNEL = 0  # 0-based digital input channel index
 
 # Set to True once to dump the OPC UA node tree on startup (useful when porting
 # to a different firmware version where node paths may differ). Reset to False
 # for normal operation.
-DEBUG_BROWSE   = False
+DEBUG_BROWSE = False
 
 # Polling interval (in seconds) for the LastScan* variables while a session is
 # active. The RF695R updates these on every successful tag read, so 50 ms gives
 # near-real-time tag capture without saturating the network.
-SCAN_POLL      = 0.05
+SCAN_POLL = 0.05
 
 
 # =============================================================================
 # CSV output
 # =============================================================================
+_CSV_HEADER = ["Timestamp", "EPC/Tag ID", "Antenna", "RSSI (dBm)", "Session ID"]
+
+
 def _daily_csv_path() -> str:
     """Return the path of today's CSV file inside OUTPUT_DIR."""
     return os.path.join(OUTPUT_DIR, f"RFID_{datetime.now().strftime('%Y-%m-%d')}.csv")
@@ -104,6 +119,9 @@ def _daily_csv_path() -> str:
 
 def _write_csv_rows(path: str, tags: dict, sid: str) -> None:
     """Append the given tags to a CSV file, writing the header on first use.
+
+    Used for per-session backup files. The daily file uses
+    :func:`_upsert_daily_csv` instead.
 
     Args:
         path: Target CSV file path.
@@ -115,10 +133,46 @@ def _write_csv_rows(path: str, tags: dict, sid: str) -> None:
     with open(path, "a", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
         if write_header:
-            w.writerow(["Timestamp", "EPC/Tag ID", "Antenna", "RSSI (dBm)", "Session ID"])
+            w.writerow(_CSV_HEADER)
         for epc, rows in tags.items():
             ts, ant, rssi = rows[-1]
             w.writerow([ts, epc, ant, rssi, sid])
+
+
+def _upsert_daily_csv(path: str, tags: dict, sid: str) -> None:
+    """Rewrite the daily CSV so each EPC appears once; new session data wins.
+
+    Reads the existing file (if any), replaces or adds rows for ``tags`` using
+    each EPC's most recent read in this session, then writes via a temp file
+    and ``os.replace`` for a consistent snapshot.
+    """
+    by_epc: dict[str, list] = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", newline="", encoding="utf-8-sig") as f:
+                reader = csv.reader(f)
+                rows = list(reader)
+            start = 0
+            if rows and rows[0] == _CSV_HEADER:
+                start = 1
+            for row in rows[start:]:
+                if len(row) >= 5 and row[1].strip():
+                    by_epc[row[1]] = row[:5]
+        except (OSError, UnicodeError, csv.Error):
+            pass
+
+    for epc, read_rows in tags.items():
+        ts, ant, rssi = read_rows[-1]
+        by_epc[epc] = [ts, epc, ant, rssi, sid]
+
+    out_rows = sorted(by_epc.values(), key=lambda r: r[0])
+    d = os.path.dirname(path) or "."
+    tmp = os.path.join(d, f".{os.path.basename(path)}.tmp")
+    with open(tmp, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(_CSV_HEADER)
+        w.writerows(out_rows)
+    os.replace(tmp, path)
 
 
 def _flush_session(tags: dict, sid: str, t0: float) -> None:
@@ -129,9 +183,18 @@ def _flush_session(tags: dict, sid: str, t0: float) -> None:
 
     primary = _daily_csv_path()
     saved_to = primary
-    try:
-        _write_csv_rows(primary, tags, sid)
-    except (PermissionError, OSError) as e:
+    last_err: Optional[Exception] = None
+    for attempt in range(CSV_WRITE_RETRIES):
+        try:
+            _upsert_daily_csv(primary, tags, sid)
+            last_err = None
+            break
+        except (PermissionError, OSError) as e:
+            last_err = e
+            if attempt + 1 < CSV_WRITE_RETRIES:
+                time.sleep(CSV_RETRY_DELAY_SEC)
+    if last_err is not None:
+        e = last_err
         # The daily CSV is locked by another process (e.g. open in Excel).
         # Fall back to a per-session backup file so data is never lost; the
         # operator can merge it back into the daily CSV manually.
@@ -162,26 +225,23 @@ class _Session:
     """Tracks the tags collected between a ScanStart and the matching ScanStop.
 
     A session starts when the trigger goes active (e.g. the photoelectric
-    sensor sees its reflector) and ends when it goes inactive again. Tags
-    that were already saved in a previous session of the same run are
-    silently ignored, so each session's CSV write only contains genuinely
-    new EPCs.
+    sensor sees its reflector) and ends when it goes inactive again. The
+    daily CSV merges by EPC so revisits overwrite the stored row for that day.
     """
 
     def __init__(self) -> None:
-        self._no       = 0           # Monotonic session counter for this run
-        self.active    = False
-        self.tags:  dict  = {}
-        self.sid:   str   = ""
-        self.t0:    float = 0.0
-        self._seen_epcs: set = set()  # EPCs already persisted to CSV in this run
+        self._no = 0  # Monotonic session counter for this run
+        self.active = False
+        self.tags: dict = {}
+        self.sid: str = ""
+        self.t0: float = 0.0
 
     def start(self, trigger: str = "") -> None:
-        self._no   += 1
+        self._no += 1
         self.active = True
-        self.tags   = {}
-        self.t0     = time.time()
-        self.sid    = f"S{datetime.now().strftime('%Y%m%d_%H%M%S')}_{self._no:03d}"
+        self.tags = {}
+        self.t0 = time.time()
+        self.sid = f"S{datetime.now().strftime('%Y%m%d_%H%M%S')}_{self._no:03d}"
         label = "Reflector detected" if trigger == "DI" else "Cart arrived"
         print(f"\n[DETECT] {label}  ->  session {self.sid}")
 
@@ -189,16 +249,13 @@ class _Session:
         if self.active:
             try:
                 _flush_session(self.tags, self.sid, self.t0)
-                self._seen_epcs.update(self.tags.keys())
             except Exception as e:
                 print(f"[ERR] Session save failed: {e}  (continuing)")
         self.active = False
-        self.tags   = {}
+        self.tags = {}
 
     def add_tag(self, epc: str, ant: str, rssi: str) -> None:
         if not self.active:
-            return
-        if epc in self._seen_epcs:
             return
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         if epc not in self.tags:
@@ -572,9 +629,15 @@ async def _run() -> None:
                 await asyncio.sleep(0.5)
 
                 if TRIGGER_SOURCE == "DI":
-                    await _run_di_loop(rp, di_node, scan_nodes,
-                                       scan_active_node, scan_start_node, scan_stop_node,
-                                       session)
+                    exit_process = await _run_di_loop(
+                        rp, di_node, scan_nodes,
+                        scan_active_node, scan_start_node, scan_stop_node,
+                        session,
+                    )
+                    if exit_process:
+                        print("[STOP] Beam blocked longer than "
+                              f"{BLOCK_GRACE_SEC:.0f}s - session saved, exiting.")
+                        return
                 else:
                     await _run_presence_loop(rp, presence_node, scan_nodes,
                                              scan_active_node, scan_start_node, scan_stop_node,
@@ -597,13 +660,17 @@ async def _run() -> None:
 
 async def _run_di_loop(rp, di_node, scan_nodes,
                        scan_active_node, scan_start_node, scan_stop_node,
-                       session: "_Session") -> None:
-    """Trigger loop driven by a digital-input photoelectric sensor."""
+                       session: "_Session") -> bool:
+    """Trigger loop driven by a digital-input photoelectric sensor.
+
+    Returns True if the process should exit after a beam break longer than
+    :data:`BLOCK_GRACE_SEC`; False to keep the outer reconnect loop running.
+    """
     if di_node is None:
         print(f"[ERR] DI{DI_CHANNEL} node not found - cannot run DI trigger.")
         print("      Set DEBUG_BROWSE=True and restart to inspect the OPC UA tree.")
         await asyncio.sleep(RETRY_DELAY)
-        return
+        return False
 
     try:
         raw     = await di_node.read_value()
@@ -615,9 +682,23 @@ async def _run_di_loop(rp, di_node, scan_nodes,
     last_di_check = 0.0
     prev_scan_ts  = None
     err_count     = 0
+    # After a falling edge during an active session: wait up to BLOCK_GRACE_SEC
+    # for the beam to clear; if it does, resume the same session without flushing.
+    beam_break_grace = False
+    beam_break_mono  = 0.0
 
     while True:
         now = time.monotonic()
+
+        if beam_break_grace and session.active:
+            if now - beam_break_mono >= BLOCK_GRACE_SEC:
+                print(
+                    f"\n[TIMEOUT] Beam blocked for >= {BLOCK_GRACE_SEC:.0f}s - "
+                    "finalizing session and exiting program."
+                )
+                beam_break_grace = False
+                session.stop()
+                return True
 
         if now - last_di_check >= POLL_INTERVAL:
             last_di_check = now
@@ -635,19 +716,38 @@ async def _run_di_loop(rp, di_node, scan_nodes,
                 continue
 
             if di_val and not prev_di:
-                session.start(trigger="DI")
-                await _start_scanning(rp, scan_start_node, scan_active_node)
-                prev_scan_ts = None
+                if beam_break_grace and session.active:
+                    beam_break_grace = False
+                    print(
+                        f"\n[RESUME] Beam cleared within {BLOCK_GRACE_SEC:.0f}s - "
+                        f"continuing session {session.sid}"
+                    )
+                    await _start_scanning(rp, scan_start_node, scan_active_node)
+                    prev_scan_ts = None
+                else:
+                    beam_break_grace = False
+                    session.start(trigger="DI")
+                    await _start_scanning(rp, scan_start_node, scan_active_node)
+                    prev_scan_ts = None
 
             elif not di_val and prev_di:
                 print("\n[SENSOR] Beam blocked - stopping scan ...")
                 await _stop_scanning(rp, scan_stop_node, scan_active_node)
-                session.stop()
-                print(f"[WAIT] Waiting for sensor on DI{DI_CHANNEL} ...\n")
+                if session.active:
+                    beam_break_grace = True
+                    beam_break_mono  = now
+                    print(
+                        f"[GRACE] If the beam clears within {BLOCK_GRACE_SEC:.0f}s, "
+                        "the same session continues; otherwise the program exits "
+                        "after saving."
+                    )
+                else:
+                    session.stop()
+                    print(f"[WAIT] Waiting for sensor on DI{DI_CHANNEL} ...\n")
 
             prev_di = di_val
 
-        if session.active:
+        if session.active and not beam_break_grace:
             prev_scan_ts = await _poll_last_scan(session, scan_nodes, prev_scan_ts)
 
         await asyncio.sleep(SCAN_POLL)
